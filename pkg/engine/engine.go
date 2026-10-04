@@ -4,6 +4,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"sort"
 	"sync"
@@ -23,6 +24,27 @@ const maxDropRecords = 1024
 // ErrNotRunning 表示在引擎未启动或已关闭后调用了需要运行态的方法。
 var ErrNotRunning = errors.New("engine not running")
 
+// ErrIncompatibleCheckpoint 表示检查点无法安全恢复：
+// 快照的窗口语义参数（WindowSize/MaxOutOfOrderness/AllowedLateness）
+// 与引擎当前配置不一致，继续恢复会静默算错，必须显式拒绝。
+// 注意：Parallelism 不同不属于不兼容——已提交窗口集合与水位线
+// 都是并行度无关的状态，允许换并行度（扩缩容）恢复。
+var ErrIncompatibleCheckpoint = errors.New("engine: incompatible checkpoint")
+
+// checkCompatible 校验检查点与引擎配置的兼容性，不兼容时返回带明细的错误。
+func checkCompatible(cp *checkpoint.Checkpoint, cfg Config) error {
+	if cp.WindowSize == cfg.WindowSize &&
+		cp.MaxOutOfOrderness == cfg.MaxOutOfOrderness &&
+		cp.AllowedLateness == cfg.AllowedLateness {
+		return nil
+	}
+	return fmt.Errorf("%w: 检查点语义参数(windowSize=%v maxOutOfOrderness=%v allowedLateness=%v) "+
+		"与引擎配置(windowSize=%v maxOutOfOrderness=%v allowedLateness=%v)不一致",
+		ErrIncompatibleCheckpoint,
+		cp.WindowSize, cp.MaxOutOfOrderness, cp.AllowedLateness,
+		cfg.WindowSize, cfg.MaxOutOfOrderness, cfg.AllowedLateness)
+}
+
 // Config 为引擎配置。
 type Config struct {
 	WindowSize        time.Duration // 滚动窗口长度（事件时间）
@@ -31,6 +53,9 @@ type Config struct {
 	InputBuffer       int           // 入口有界缓冲容量（背压边界）
 	Parallelism       int           // 处理分片数；同一 key 始终由同一分片串行处理
 	CheckpointEveryN  int           // 每接收 N 条事件做一次周期检查点；0 表示关闭
+	// IdleTimeout 为数据源分片空闲阈值（处理时间）：某分片超过该时长未供数
+	// 即视为 idle，暂时排除出全局水位线计算；<=0 表示不做空闲检测。
+	IdleTimeout time.Duration
 }
 
 // Stats 为引擎可观测计数。
@@ -40,13 +65,16 @@ type Stats struct {
 	DuplicateSkipped    int64
 	LateDropped         int64
 	BackpressureDropped int64
-	WindowsEmitted      int64
-	Checkpoints         int64
+	// PartitionFinishedDropped 为来自已宣告终止分片而被拒绝的事件数。
+	PartitionFinishedDropped int64
+	WindowsEmitted           int64
+	Checkpoints              int64
 }
 
-// shardMsg 为路由到分片的消息：要么是一条事件，要么是检查点屏障。
+// shardMsg 为路由到分片的消息：一条事件、一次定稿冲刷通知，或检查点屏障。
 type shardMsg struct {
 	ev      event.Event
+	emit    bool // 水位线已推进：通知分片冲刷到期的窗口
 	barrier *barrier
 }
 
@@ -67,7 +95,7 @@ type Engine struct {
 	snk      sink.Sink
 	store    checkpoint.Store
 	assigner *window.Assigner
-	wm       *watermark.Generator
+	wm       *watermark.Tracker
 
 	in   chan event.Event
 	quit chan struct{}
@@ -82,24 +110,29 @@ type Engine struct {
 	closed    atomic.Bool
 	started   atomic.Bool
 
-	ckptReq chan ckptRequest
-	ctx     context.Context
+	ckptReq  chan ckptRequest
+	wmNotify chan struct{} // 分片→路由的水位线推进通知（容量1，非阻塞投递）
+	ctx      context.Context
 
 	// 原子计数器
-	received            atomic.Int64
-	accepted            atomic.Int64
-	duplicateSkipped    atomic.Int64
-	lateDropped         atomic.Int64
-	backpressureDropped atomic.Int64
-	windowsEmitted      atomic.Int64
-	checkpoints         atomic.Int64
-	maxSeq              atomic.Int64
+	received                 atomic.Int64
+	accepted                 atomic.Int64
+	duplicateSkipped         atomic.Int64
+	lateDropped              atomic.Int64
+	backpressureDropped      atomic.Int64
+	partitionFinishedDropped atomic.Int64
+	windowsEmitted           atomic.Int64
+	checkpoints              atomic.Int64
+	maxSeq                   atomic.Int64
 
 	dropsMu sync.Mutex
 	drops   []event.DropRecord
 
 	committedMu sync.Mutex
 	committed   map[checkpoint.WindowRef]struct{}
+
+	openMu   sync.Mutex
+	openRefs map[checkpoint.WindowRef]struct{} // 仍在等待定稿的窗口（快照用）
 }
 
 type ckptRequest struct {
@@ -133,11 +166,13 @@ func New(cfg Config, snk sink.Sink, store checkpoint.Store) *Engine {
 		snk:       snk,
 		store:     store,
 		assigner:  window.NewTumblingAssigner(cfg.WindowSize),
-		wm:        watermark.New(cfg.MaxOutOfOrderness),
+		wm:        watermark.NewTracker(cfg.MaxOutOfOrderness, cfg.IdleTimeout),
 		in:        make(chan event.Event, cfg.InputBuffer),
 		quit:      make(chan struct{}),
 		committed: make(map[checkpoint.WindowRef]struct{}),
+		openRefs:  make(map[checkpoint.WindowRef]struct{}),
 		ckptReq:   make(chan ckptRequest),
+		wmNotify:  make(chan struct{}, 1),
 	}
 }
 
@@ -154,10 +189,15 @@ func (e *Engine) Start(ctx context.Context) error {
 	if e.store != nil {
 		cp, err := e.store.LoadLatest(ctx)
 		if err != nil {
+			e.cancel()
 			return err
 		}
 		if cp != nil {
-			e.wm.Restore(cp.Watermark)
+			if err := checkCompatible(cp, e.cfg); err != nil {
+				e.cancel()
+				return err
+			}
+			e.wm.Restore(cp.Partitions, cp.Watermark)
 			for _, ref := range cp.CommittedWindows {
 				e.committed[ref] = struct{}{}
 			}
@@ -181,14 +221,31 @@ func (e *Engine) Start(ctx context.Context) error {
 }
 
 // runRouter 单线程路由事件并串行化所有检查点请求。
+//
+// 水位线广播：分片处理事件使全局水位线推进后，通过 wmNotify 通知路由线程；
+// 路由线程向所有分片广播冲刷通知。这样即使某数据源分片转入空闲、不再产生
+// 事件，其 key 所在的处理分片也能随全局水位线推进及时定稿窗口。
+// 广播由通知驱动（而非路由侧读取），避免“路由读水位线早于分片处理”的竞态。
 func (e *Engine) runRouter(ctx context.Context) {
 	defer e.routerWg.Done()
 	var routed int64
+	var lastEmitWM time.Time
 	in := e.in
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-e.wmNotify:
+			if wm := e.wm.Current(); wm.After(lastEmitWM) {
+				lastEmitWM = wm
+				for _, sh := range e.shards {
+					select {
+					case sh.ch <- shardMsg{emit: true}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
 		case req := <-e.ckptReq:
 			cp, err := e.barrierCheckpoint(ctx)
 			req.reply <- ckptResult{cp: cp, err: err}
@@ -234,13 +291,23 @@ func (e *Engine) runShard(ctx context.Context, sh *shard) {
 				return
 			}
 			if msg.barrier != nil {
-				// 处理到屏障：此前所有事件均已完成（含窗口触发写出）。
+				// 处理到屏障：此前所有事件均已完成。
+				// 先按当前全局水位线冲刷到期窗口再 ack：
+				// 多分片（数据源）水位线取 min，本分片窗口可能因其他分片
+				// 推进的水位线而到期，必须在此补齐，才能维持检查点不变式
+				// “凡定稿线 <= 水位线的窗口都已在已提交集合中”。
+				e.emitDue(sh, e.wm.Current())
 				msg.barrier.ack <- struct{}{}
 				select {
 				case <-msg.barrier.resume:
 				case <-ctx.Done():
 					return
 				}
+				continue
+			}
+			if msg.emit {
+				// 水位线推进通知：冲刷本分片内到期的窗口（无到期则为空操作）。
+				e.emitDue(sh, e.wm.Current())
 				continue
 			}
 			e.process(ctx, sh, msg.ev)
@@ -255,7 +322,18 @@ func (e *Engine) process(ctx context.Context, sh *shard, ev event.Event) {
 		e.maxSeq.Store(s)
 	}
 
-	wm := e.wm.Observe(ev.Timestamp)
+	wm, ok := e.wm.Observe(ev.Partition, ev.Timestamp)
+	if !ok {
+		// 分片已被显式宣告彻底不再供数：明确拒绝，原因与迟到/背压可区分。
+		e.reject(ev, event.ReasonPartitionFinished)
+		e.partitionFinishedDropped.Add(1)
+		return
+	}
+	// 水位线可能已推进：通知路由线程向所有分片广播冲刷（非阻塞，容量1去抖）。
+	select {
+	case e.wmNotify <- struct{}{}:
+	default:
+	}
 	w := e.assigner.Assign(ev.Timestamp)
 	// 窗口定稿时刻：水位线越过 End+AllowedLateness。
 	deadline := w.End.Add(e.cfg.AllowedLateness)
@@ -277,6 +355,9 @@ func (e *Engine) process(ctx context.Context, sh *shard, ev event.Event) {
 	if !ok {
 		st = window.NewState()
 		byKey[w] = st
+		e.openMu.Lock()
+		e.openRefs[checkpoint.WindowRef{Key: ev.Key, Start: w.Start, End: w.End}] = struct{}{}
+		e.openMu.Unlock()
 	}
 	if st.Add(ev) {
 		e.accepted.Add(1)
@@ -349,6 +430,9 @@ func (e *Engine) commitWindow(sh *shard, key string, w window.Window, st *window
 		if len(sh.states[key]) == 0 {
 			delete(sh.states, key)
 		}
+		e.openMu.Lock()
+		delete(e.openRefs, ref)
+		e.openMu.Unlock()
 		return
 	}
 
@@ -367,6 +451,18 @@ func (e *Engine) commitWindow(sh *shard, key string, w window.Window, st *window
 	if len(sh.states[key]) == 0 {
 		delete(sh.states, key)
 	}
+	e.openMu.Lock()
+	delete(e.openRefs, ref)
+	e.openMu.Unlock()
+}
+
+// FinishPartition 显式宣告某个数据源分片彻底不再供数。
+//
+// 与空闲（idle，暂时无数据、恢复供数后自动回归）不同，该宣告不可逆：
+// 分片被永久排除出全局水位线计算，其后续事件一律以
+// partition_finished 原因拒绝（计数 Stats.PartitionFinishedDropped）。
+func (e *Engine) FinishPartition(id string) {
+	e.wm.Finish(id)
 }
 
 // barrierCheckpoint 暂停全部分片，在静态点拍摄快照后恢复。
@@ -416,16 +512,33 @@ func (e *Engine) saveSnapshot(ctx context.Context) (*checkpoint.Checkpoint, erro
 
 	id := e.checkpoints.Add(1)
 	cp := &checkpoint.Checkpoint{
-		ID:               id,
-		Watermark:        e.wm.Current(),
-		MaxSeq:           e.maxSeq.Load(),
-		CommittedWindows: refs,
-		CreatedAt:        time.Now(),
+		ID:                id,
+		Watermark:         e.wm.Current(),
+		MaxSeq:            e.maxSeq.Load(),
+		CommittedWindows:  refs,
+		Parallelism:       e.cfg.Parallelism,
+		WindowSize:        e.cfg.WindowSize,
+		MaxOutOfOrderness: e.cfg.MaxOutOfOrderness,
+		AllowedLateness:   e.cfg.AllowedLateness,
+		Partitions:        e.partitionProgress(),
+		CreatedAt:         time.Now(),
 	}
 	if err := e.store.Save(ctx, cp); err != nil {
 		return nil, err
 	}
 	return cp, nil
+}
+
+// partitionProgress 导出各数据源分片已观测的最大事件时间（供检查点持久化）。
+func (e *Engine) partitionProgress() map[string]time.Time {
+	infos := e.wm.Partitions()
+	out := make(map[string]time.Time, len(infos))
+	for _, info := range infos {
+		if !info.MaxObserved.IsZero() {
+			out[info.ID] = info.MaxObserved
+		}
+	}
+	return out
 }
 
 // Enqueue 将事件提交到引擎入口；缓冲满时立即返回 false 并记录背压丢弃。
@@ -480,13 +593,14 @@ func (e *Engine) Watermark() time.Time { return e.wm.Current() }
 // Stats 返回当前计数快照。
 func (e *Engine) Stats() Stats {
 	return Stats{
-		Received:            e.received.Load(),
-		Accepted:            e.accepted.Load(),
-		DuplicateSkipped:    e.duplicateSkipped.Load(),
-		LateDropped:         e.lateDropped.Load(),
-		BackpressureDropped: e.backpressureDropped.Load(),
-		WindowsEmitted:      e.windowsEmitted.Load(),
-		Checkpoints:         e.checkpoints.Load(),
+		Received:                 e.received.Load(),
+		Accepted:                 e.accepted.Load(),
+		DuplicateSkipped:         e.duplicateSkipped.Load(),
+		LateDropped:              e.lateDropped.Load(),
+		BackpressureDropped:      e.backpressureDropped.Load(),
+		PartitionFinishedDropped: e.partitionFinishedDropped.Load(),
+		WindowsEmitted:           e.windowsEmitted.Load(),
+		Checkpoints:              e.checkpoints.Load(),
 	}
 }
 

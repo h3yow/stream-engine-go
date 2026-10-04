@@ -53,10 +53,22 @@ func main() {
 		ok := eng.Enqueue(ev)
 		fmt.Printf("[注入] seq=%d key=%s eventTime=%ds value=%d → enqueued=%v\n",
 			ev.Seq, ev.Key, ev.Timestamp.Unix(), ev.Value, ok)
+		// 小幅间隔让处理跟上注入顺序，演示输出与注释的逐条判定一一对应。
+		time.Sleep(5 * time.Millisecond)
 	}
 	time.Sleep(100 * time.Millisecond) // 等待处理排空
 	fmt.Printf("[排空后] 全局水位线=%ds（定稿条件：wm >= windowEnd + allowedLateness=5s）\n",
 		eng.Watermark().Unix())
+
+	// 运行期状态快照：水位线、分片状态、待定/已定稿窗口、按原因的拒绝计数。
+	snap := eng.Snapshot()
+	fmt.Println("\n== 状态快照 ==")
+	fmt.Printf("水位线=%ds maxSeq=%d 待定窗口=%d 已定稿窗口=%d 拒绝计数=%v\n",
+		snap.Watermark.Unix(), snap.MaxSeq, len(snap.PendingWindows),
+		len(snap.CommittedWindows), snap.Drops)
+	for _, p := range snap.Partitions {
+		fmt.Printf("  分片=%q 状态=%s 分片水位线=%ds\n", p.ID, p.Status, p.Watermark.Unix())
+	}
 	if err := eng.Close(); err != nil {
 		panic(err)
 	}

@@ -23,7 +23,19 @@ type Checkpoint struct {
 	MaxSeq int64
 	// CommittedWindows 为已向下游提交的窗口集合，恢复后用于幂等去重。
 	CommittedWindows []WindowRef
-	CreatedAt        time.Time
+	// Parallelism 为拍摄时的处理分片数。
+	// 恢复时允许与引擎当前并行度不同（扩缩容）：已提交窗口集合与
+	// 水位线都是并行度无关的状态，换并行度恢复语义不变。
+	Parallelism int
+	// 以下三个字段为窗口语义参数，决定窗口边界与定稿判定，
+	// 恢复时必须与引擎配置完全一致，否则检查点不兼容、必须拒绝恢复。
+	WindowSize        time.Duration
+	MaxOutOfOrderness time.Duration
+	AllowedLateness   time.Duration
+	// Partitions 为各数据源分片已观测的最大事件时间，
+	// 用于恢复分片级水位线跟踪（空 map 表示无分片信息）。
+	Partitions map[string]time.Time
+	CreatedAt  time.Time
 }
 
 // Store 为检查点存储。
@@ -69,5 +81,11 @@ func (s *MemoryStore) LoadLatest(ctx context.Context) (*Checkpoint, error) {
 func clone(cp *Checkpoint) *Checkpoint {
 	out := *cp
 	out.CommittedWindows = append([]WindowRef(nil), cp.CommittedWindows...)
+	if cp.Partitions != nil {
+		out.Partitions = make(map[string]time.Time, len(cp.Partitions))
+		for k, v := range cp.Partitions {
+			out.Partitions[k] = v
+		}
+	}
 	return &out
 }
