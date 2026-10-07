@@ -118,16 +118,56 @@ func TestTrackerFinish(t *testing.T) {
 func TestTrackerRestore(t *testing.T) {
 	clk := &testClock{now: ts(1000)}
 	tr := NewTrackerWithClock(0, time.Minute, clk.Now)
-	tr.Restore(map[string]time.Time{"p0": ts(100), "p1": ts(90)}, ts(85))
+	tr.Restore(map[string]time.Time{"p0": ts(100), "p1": ts(90)}, nil, ts(85))
 
 	if wm := tr.Current(); wm != ts(90) {
 		t.Fatalf("恢复后水位线应取 min(100,90)=90s，实际 %v", wm)
 	}
 	// 恢复快照水位线兜底：即使分片信息缺失也不回退。
 	tr2 := NewTrackerWithClock(0, time.Minute, clk.Now)
-	tr2.Restore(nil, ts(85))
+	tr2.Restore(nil, nil, ts(85))
 	if wm := tr2.Current(); wm != ts(85) {
 		t.Fatalf("无分片信息时水位线应由快照兜底为85s，实际 %v", wm)
 	}
 	t.Logf("[恢复] 分片进展 {p0:100s,p1:90s} + 快照水位线85s → 恢复后水位线90s")
+}
+
+// TestTrackerRestoreFinished 终止分片清单随检查点恢复后依旧生效：
+// 含“从未供数就被终止”的分片（无历史数据，不在 parts 进展中），
+// 恢复后依旧永久排除、拒绝后续事件；其余分片恢复为 active 正常参与。
+func TestTrackerRestoreFinished(t *testing.T) {
+	clk := &testClock{now: ts(1000)}
+	tr := NewTrackerWithClock(0, time.Minute, clk.Now)
+	tr.Restore(
+		map[string]time.Time{"p0": ts(100), "p1": ts(90)},
+		[]string{"p1", "ghost"}, // p1 有历史数据；ghost 从未供数就被终止
+		ts(85),
+	)
+
+	// p1/ghost 保持 finished：事件被拒，且不参与水位线（min 只剩 p0）。
+	if _, ok := tr.Observe("p1", ts(200)); ok {
+		t.Fatal("恢复后已终止分片 p1 不得接受事件")
+	}
+	if _, ok := tr.Observe("ghost", ts(300)); ok {
+		t.Fatal("恢复后零数据终止分片 ghost 不得接受事件")
+	}
+	if wm := tr.Current(); wm != ts(100) {
+		t.Fatalf("终止分片不参与水位线，应只剩 p0=100s，实际 %v", wm)
+	}
+	status := map[string]PartitionStatus{}
+	for _, info := range tr.Partitions() {
+		status[info.ID] = info.Status
+	}
+	if status["p1"] != StatusFinished || status["ghost"] != StatusFinished {
+		t.Fatalf("p1/ghost 恢复后应保持 finished，实际 %v", status)
+	}
+	if status["p0"] != StatusActive {
+		t.Fatalf("p0 恢复后应为 active，实际 %v", status)
+	}
+	// Finished 导出清单供下一次检查点持久化（含 ghost，排序、非 nil）。
+	got := tr.Finished()
+	if len(got) != 2 || got[0] != "ghost" || got[1] != "p1" {
+		t.Fatalf("Finished 导出期望 [ghost p1]，实际 %v", got)
+	}
+	t.Logf("[恢复] 终止分片 {p1,ghost} 恢复后保持 finished 并被拒；p0 active，水位线=100s")
 }

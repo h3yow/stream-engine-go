@@ -29,8 +29,39 @@ type Snapshot struct {
 	Stats            Stats
 }
 
-// Snapshot 拍摄当前状态快照；可在运行中随时调用，不阻塞事件处理管线。
+// Snapshot 拍摄当前状态快照；可在运行中随时调用。
+//
+// 一致性保证：引擎运行中时，快照经路由线程在与检查点相同的屏障静态点
+// 拍摄（短暂暂停各分片），因此 Watermark、Partitions、PendingWindows、
+// CommittedWindows、Drops、Stats 互为同一时刻的一致视图——不会出现
+// “计数已加上、对应窗口还没出现”这类自相矛盾；在静态点上还满足
+// “定稿线 ≤ 水位线的窗口都已在 CommittedWindows 中”。
+// 引擎已停止（Close/Abort）时处理管线已静止，直接读取即可，同样一致。
+// 反复调用读到的清单均排序、计数单调，可直接对比核对。
 func (e *Engine) Snapshot() Snapshot {
+	if e.started.Load() && !e.closed.Load() {
+		req := snapRequest{reply: make(chan Snapshot, 1)}
+		select {
+		case e.snapReq <- req:
+			select {
+			case snap := <-req.reply:
+				return snap
+			case <-e.quit: // 引擎正在关闭：转为静止后直读
+			}
+		case <-e.quit: // 引擎正在关闭：转为静止后直读
+		}
+		// 等待处理管线完全停下，此后状态不再变化，直读即一致。
+		e.routerWg.Wait()
+		e.shardWg.Wait()
+	}
+	return e.buildSnapshot(e.wm.Current())
+}
+
+// buildSnapshot 以稳定水位线 wm 直接读取各状态组装快照。
+// 调用前提：处于屏障静态点（分片全部暂停）或处理管线已停止，
+// 即读数期间没有任何分片在修改这些状态；wm 为静态点读取的水位线，
+// 与窗口清单、计数同属同一时刻。
+func (e *Engine) buildSnapshot(wm time.Time) Snapshot {
 	e.openMu.Lock()
 	pending := make([]checkpoint.WindowRef, 0, len(e.openRefs))
 	for ref := range e.openRefs {
@@ -57,7 +88,7 @@ func (e *Engine) Snapshot() Snapshot {
 	less(committed)
 
 	return Snapshot{
-		Watermark:        e.wm.Current(),
+		Watermark:        wm,
 		MaxSeq:           e.maxSeq.Load(),
 		Partitions:       e.wm.Partitions(),
 		PendingWindows:   pending,

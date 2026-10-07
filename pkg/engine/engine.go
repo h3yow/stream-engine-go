@@ -33,16 +33,23 @@ var ErrIncompatibleCheckpoint = errors.New("engine: incompatible checkpoint")
 
 // checkCompatible 校验检查点与引擎配置的兼容性，不兼容时返回带明细的错误。
 func checkCompatible(cp *checkpoint.Checkpoint, cfg Config) error {
-	if cp.WindowSize == cfg.WindowSize &&
-		cp.MaxOutOfOrderness == cfg.MaxOutOfOrderness &&
-		cp.AllowedLateness == cfg.AllowedLateness {
-		return nil
+	if cp.WindowSize != cfg.WindowSize ||
+		cp.MaxOutOfOrderness != cfg.MaxOutOfOrderness ||
+		cp.AllowedLateness != cfg.AllowedLateness {
+		return fmt.Errorf("%w: 检查点语义参数(windowSize=%v maxOutOfOrderness=%v allowedLateness=%v) "+
+			"与引擎配置(windowSize=%v maxOutOfOrderness=%v allowedLateness=%v)不一致",
+			ErrIncompatibleCheckpoint,
+			cp.WindowSize, cp.MaxOutOfOrderness, cp.AllowedLateness,
+			cfg.WindowSize, cfg.MaxOutOfOrderness, cfg.AllowedLateness)
 	}
-	return fmt.Errorf("%w: 检查点语义参数(windowSize=%v maxOutOfOrderness=%v allowedLateness=%v) "+
-		"与引擎配置(windowSize=%v maxOutOfOrderness=%v allowedLateness=%v)不一致",
-		ErrIncompatibleCheckpoint,
-		cp.WindowSize, cp.MaxOutOfOrderness, cp.AllowedLateness,
-		cfg.WindowSize, cfg.MaxOutOfOrderness, cfg.AllowedLateness)
+	if cp.FinishedPartitions == nil {
+		// 旧版本检查点未记录已终止分片：恢复会把它们错误地当作正常供数，
+		// 属于会静默错算的缺字段格式，必须明确拒绝。
+		return fmt.Errorf("%w: 检查点缺少已终止分片记录(FinishedPartitions)，"+
+			"为旧版本格式，无法保证终止分片语义，请从重写或升级前的最后一个兼容检查点恢复",
+			ErrIncompatibleCheckpoint)
+	}
+	return nil
 }
 
 // Config 为引擎配置。
@@ -78,10 +85,14 @@ type shardMsg struct {
 	barrier *barrier
 }
 
-// barrier 是分片间的暂停/恢复屏障，用于拍摄一致检查点。
+// barrier 是分片间的暂停/恢复屏障，用于拍摄一致检查点与一致快照。
 type barrier struct {
 	ack    chan struct{} // 每个分片处理到屏障时发送一次
 	resume chan struct{} // 关闭后分片继续运行
+	// flush=true 时，分片在 ack 前按 wm（全部分片暂停后读取的稳定水位线）
+	// 冲刷到期窗口；flush=false 用于第一轮屏障（只等待在途事件处理完）。
+	flush bool
+	wm    time.Time
 }
 
 type shard struct {
@@ -111,6 +122,7 @@ type Engine struct {
 	started   atomic.Bool
 
 	ckptReq  chan ckptRequest
+	snapReq  chan snapRequest
 	wmNotify chan struct{} // 分片→路由的水位线推进通知（容量1，非阻塞投递）
 	ctx      context.Context
 
@@ -144,6 +156,11 @@ type ckptResult struct {
 	err error
 }
 
+// snapRequest 为路由线程串行处理的快照请求：在屏障静态点拍摄后回送。
+type snapRequest struct {
+	reply chan Snapshot
+}
+
 // New 创建引擎；store 为 nil 时不做持久化检查点。
 func New(cfg Config, snk sink.Sink, store checkpoint.Store) *Engine {
 	if cfg.WindowSize <= 0 {
@@ -172,6 +189,7 @@ func New(cfg Config, snk sink.Sink, store checkpoint.Store) *Engine {
 		committed: make(map[checkpoint.WindowRef]struct{}),
 		openRefs:  make(map[checkpoint.WindowRef]struct{}),
 		ckptReq:   make(chan ckptRequest),
+		snapReq:   make(chan snapRequest),
 		wmNotify:  make(chan struct{}, 1),
 	}
 }
@@ -197,7 +215,7 @@ func (e *Engine) Start(ctx context.Context) error {
 				e.cancel()
 				return err
 			}
-			e.wm.Restore(cp.Partitions, cp.Watermark)
+			e.wm.Restore(cp.Partitions, cp.FinishedPartitions, cp.Watermark)
 			for _, ref := range cp.CommittedWindows {
 				e.committed[ref] = struct{}{}
 			}
@@ -249,6 +267,12 @@ func (e *Engine) runRouter(ctx context.Context) {
 		case req := <-e.ckptReq:
 			cp, err := e.barrierCheckpoint(ctx)
 			req.reply <- ckptResult{cp: cp, err: err}
+		case req := <-e.snapReq:
+			// 与检查点同一静态点拍摄：两轮屏障暂停全部分片后读取，
+			// 保证快照各字段互为同一时刻的一致视图。
+			var snap Snapshot
+			_ = e.withBarrier(ctx, func(wm time.Time) { snap = e.buildSnapshot(wm) })
+			req.reply <- snap
 		case ev, ok := <-in:
 			if !ok {
 				// 入口关闭：关闭各分片通道，分片会冲刷剩余窗口后退出。
@@ -257,8 +281,9 @@ func (e *Engine) runRouter(ctx context.Context) {
 				}
 				e.shardWg.Wait()
 				// 冲刷完成后做最后一次检查点，固化全部已提交窗口。
+				// 分片已全部退出，水位线稳定，直接读取即可。
 				if e.store != nil {
-					_, _ = e.saveSnapshot(ctx)
+					_, _ = e.saveSnapshot(ctx, e.wm.Current())
 				}
 				return
 			}
@@ -292,11 +317,13 @@ func (e *Engine) runShard(ctx context.Context, sh *shard) {
 			}
 			if msg.barrier != nil {
 				// 处理到屏障：此前所有事件均已完成。
-				// 先按当前全局水位线冲刷到期窗口再 ack：
+				// flush 屏障需先按屏障携带的稳定水位线冲刷到期窗口再 ack：
 				// 多分片（数据源）水位线取 min，本分片窗口可能因其他分片
-				// 推进的水位线而到期，必须在此补齐，才能维持检查点不变式
+				// 推进的水位线而到期，必须在此补齐，才能维持静态点不变式
 				// “凡定稿线 <= 水位线的窗口都已在已提交集合中”。
-				e.emitDue(sh, e.wm.Current())
+				if msg.barrier.flush {
+					e.emitDue(sh, msg.barrier.wm)
+				}
 				msg.barrier.ack <- struct{}{}
 				select {
 				case <-msg.barrier.resume:
@@ -473,30 +500,64 @@ func (e *Engine) barrierCheckpoint(ctx context.Context) (*checkpoint.Checkpoint,
 	if e.store == nil {
 		return nil, nil
 	}
-	b := &barrier{
-		ack:    make(chan struct{}, len(e.shards)),
-		resume: make(chan struct{}),
+	var cp *checkpoint.Checkpoint
+	var err error
+	if perr := e.withBarrier(ctx, func(wm time.Time) { cp, err = e.saveSnapshot(ctx, wm) }); perr != nil {
+		return nil, perr
 	}
+	return cp, err
+}
+
+// withBarrier 以两轮屏障制造静态点，并在静态点执行 fn：
+//
+//	第一轮：各分片处理完屏障前的全部事件后暂停——此后没有在途事件，
+//	        全局水位线稳定，读取 wm；
+//	第二轮：各分片按同一 wm 补齐到期窗口后再次暂停——此后满足不变式
+//	        “定稿线 <= wm 的窗口都已在已提交集合中”。
+//
+// fn 在两轮屏障之间所有分片都暂停时执行，并收到同一稳定 wm：
+// 检查点与快照的水位线、已提交/待定窗口清单、计数因此互为同一时刻的
+// 一致视图（不会出现“水位线已越过定稿线、窗口却还在待定”这类矛盾）。
+// fn 执行完毕后分片恢复运行。
+func (e *Engine) withBarrier(ctx context.Context, fn func(wm time.Time)) error {
+	b1 := &barrier{ack: make(chan struct{}, len(e.shards)), resume: make(chan struct{})}
+	if err := e.barrierRound(ctx, b1); err != nil {
+		return err
+	}
+	wm := e.wm.Current()
+	close(b1.resume)
+	b2 := &barrier{ack: make(chan struct{}, len(e.shards)), resume: make(chan struct{}), flush: true, wm: wm}
+	if err := e.barrierRound(ctx, b2); err != nil {
+		return err
+	}
+	fn(wm)
+	close(b2.resume)
+	return nil
+}
+
+// barrierRound 向全部分片发送一个屏障并等待全部 ack。
+// 路由线程是屏障期间唯一的消息来源，屏障之间不会插入新事件。
+func (e *Engine) barrierRound(ctx context.Context, b *barrier) error {
 	for _, sh := range e.shards {
 		select {
 		case sh.ch <- shardMsg{barrier: b}:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 	}
 	for range e.shards {
 		select {
 		case <-b.ack:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		}
 	}
-	cp, err := e.saveSnapshot(ctx)
-	close(b.resume)
-	return cp, err
+	return nil
 }
 
-func (e *Engine) saveSnapshot(ctx context.Context) (*checkpoint.Checkpoint, error) {
+// saveSnapshot 以静态点的稳定水位线 wm 组装并保存检查点。
+// 调用前提：处于屏障静态点或处理管线已停止（分片全部暂停/退出）。
+func (e *Engine) saveSnapshot(ctx context.Context, wm time.Time) (*checkpoint.Checkpoint, error) {
 	e.committedMu.Lock()
 	refs := make([]checkpoint.WindowRef, 0, len(e.committed))
 	for ref := range e.committed {
@@ -513,15 +574,16 @@ func (e *Engine) saveSnapshot(ctx context.Context) (*checkpoint.Checkpoint, erro
 	id := e.checkpoints.Add(1)
 	cp := &checkpoint.Checkpoint{
 		ID:                id,
-		Watermark:         e.wm.Current(),
+		Watermark:         wm,
 		MaxSeq:            e.maxSeq.Load(),
 		CommittedWindows:  refs,
 		Parallelism:       e.cfg.Parallelism,
 		WindowSize:        e.cfg.WindowSize,
 		MaxOutOfOrderness: e.cfg.MaxOutOfOrderness,
 		AllowedLateness:   e.cfg.AllowedLateness,
-		Partitions:        e.partitionProgress(),
-		CreatedAt:         time.Now(),
+		Partitions:         e.partitionProgress(),
+		FinishedPartitions: e.wm.Finished(),
+		CreatedAt:          time.Now(),
 	}
 	if err := e.store.Save(ctx, cp); err != nil {
 		return nil, err

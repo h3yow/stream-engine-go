@@ -143,9 +143,14 @@ func (t *Tracker) Partitions() []PartitionInfo {
 }
 
 // Restore 从检查点恢复：parts 为各分片已观测的最大事件时间，
+// finished 为已被宣告彻底不再供数的分片清单，
 // wm 为快照时刻的全局水位线（兜底，保证恢复后水位线不回退）。
-// 恢复的分片一律以 active 状态重新开始空闲计时。
-func (t *Tracker) Restore(parts map[string]time.Time, wm time.Time) {
+//
+// 恢复的分片一律以 active 状态重新开始空闲计时（idle 是处理时间上的
+// 瞬时判定，恢复后静默超过 idleTimeout 会再次自动转入 idle）；
+// 而 finished 是持久宣告，必须原样恢复：这些分片（包括从未供数就被
+// 终止、因此不在 parts 中的分片）恢复后依旧永久排除，Observe 返回 ok=false。
+func (t *Tracker) Restore(parts map[string]time.Time, finished []string, wm time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
@@ -161,11 +166,33 @@ func (t *Tracker) Restore(parts map[string]time.Time, wm time.Time) {
 		}
 		p.lastEventAt = now
 	}
+	for _, id := range finished {
+		p := t.parts[id]
+		if p == nil {
+			p = &partState{}
+			t.parts[id] = p
+		}
+		p.finished = true
+	}
 	if !wm.IsZero() && (!t.hasWM || wm.After(t.wm)) {
 		t.wm = wm
 		t.hasWM = true
 	}
 	t.recomputeLocked()
+}
+
+// Finished 返回当前已宣告终止的分片 ID（排序、非 nil），供检查点持久化。
+func (t *Tracker) Finished() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, 0, len(t.parts))
+	for id, p := range t.parts {
+		if p.finished {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // recomputeLocked 重估空闲状态并重算全局水位线（单调不减）。必须在持有 mu 时调用。

@@ -28,6 +28,7 @@ func logDecisions(t *testing.T, eng *Engine, evs []event.Event) {
 	}
 	st := eng.Stats()
 	dupLeft := st.DuplicateSkipped
+	seen := make(map[int64]bool, len(evs)) // 同 Seq 的再次投递才判“重复跳过”
 	t.Logf("[处理后水位线] %ds（定稿条件：wm >= windowEnd + allowedLateness=%ds）",
 		eng.Watermark().Unix(), eng.cfg.AllowedLateness/time.Second)
 	for _, ev := range evs {
@@ -35,10 +36,11 @@ func logDecisions(t *testing.T, eng *Engine, evs []event.Event) {
 		verdict := "计入窗口"
 		if reason, ok := droppedSeq[ev.Seq]; ok {
 			verdict = "拒绝，原因=" + string(reason)
-		} else if dupLeft > 0 {
+		} else if seen[ev.Seq] && dupLeft > 0 {
 			verdict = "重复投递跳过（Seq 已计入）"
 			dupLeft--
 		}
+		seen[ev.Seq] = true
 		t.Logf("[逐条判定] seq=%d key=%s 事件时间=%ds 所属窗口=[%d,%d)s 定稿线=%ds → %s",
 			ev.Seq, ev.Key, ev.Timestamp.Unix(), w.Start.Unix(), w.End.Unix(),
 			w.End.Add(eng.cfg.AllowedLateness).Unix(), verdict)

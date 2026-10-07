@@ -35,7 +35,13 @@ type Checkpoint struct {
 	// Partitions 为各数据源分片已观测的最大事件时间，
 	// 用于恢复分片级水位线跟踪（空 map 表示无分片信息）。
 	Partitions map[string]time.Time
-	CreatedAt  time.Time
+	// FinishedPartitions 为已被显式宣告“彻底不再供数”的数据源分片清单
+	// （按 ID 排序，含从未供数就被终止的分片）。恢复后这些分片必须保持
+	// finished：永久排除出水位线计算，其后续事件仍以 partition_finished 拒绝。
+	// 该字段为必备字段：nil 表示旧版本检查点（未记录终止分片），
+	// 恢复方无法保证终止语义不丢失，应按不兼容明确拒绝。
+	FinishedPartitions []string
+	CreatedAt          time.Time
 }
 
 // Store 为检查点存储。
@@ -86,6 +92,10 @@ func clone(cp *Checkpoint) *Checkpoint {
 		for k, v := range cp.Partitions {
 			out.Partitions[k] = v
 		}
+	}
+	// 保留 nil 与空切片的区别：nil 是旧格式检查点的判据，不能拷成非 nil。
+	if cp.FinishedPartitions != nil {
+		out.FinishedPartitions = append([]string{}, cp.FinishedPartitions...)
 	}
 	return &out
 }

@@ -53,18 +53,41 @@ cmd/demo        端到端演示：go run ./cmd/demo
 - **终止（finished）**：`Engine.FinishPartition(id)` 显式宣告某分片**彻底不再供数**，
   与 idle 的“暂时没数据、可自动恢复”不同：finished 不可逆，分片被永久排除，
   其后续事件一律以 `partition_finished` 原因拒绝（计数 `Stats.PartitionFinishedDropped`）。
+  对从未供数的分片也可提前宣告（登记为 finished）。
 - **全部空闲**：所有分片都 idle/finished 时，全局水位线停在最近值不再推进。
-- 覆盖测试：`TestTracker*`（跟踪器单测，注入时钟）、
+
+### idle 与 finished 在检查点恢复前后的语义
+
+两种状态在恢复后依然严格可分，但持久性不同：
+
+- **idle 是处理时间上的瞬时判定，不进检查点**。恢复后所有分片以 active
+  重新计时：刚刚恢复时表现为 active（其历史最大事件时间仍参与 min 计算，
+  全局水位线由检查点兜底不回退）；若恢复后继续静默超过 `IdleTimeout`，
+  会再次自动转入 idle，水位线照常跟随其他供数分片推进、该定稿的窗口照常定稿；
+  恢复供数时，允许迟到范围内的事件正常计入、重复投递按 Seq 去重、
+  明显超范围的老事件照样按 `late_beyond_allowed_lateness` 拒绝。
+- **finished 是持久宣告，必须进检查点**（`Checkpoint.FinishedPartitions`，
+  含一条数据都没出过就被终止的分片——这类分片没有历史进展可记录，
+  终止清单是它唯一的持久化载体）。恢复后这些分片依旧保持 finished：
+  永久排除出水位线计算，其后续事件（包括重放的历史事件）一律以
+  `partition_finished` 拒绝，绝不会被重新算进窗口；恢复前后最终聚合结果一致。
+- 覆盖测试：`TestTracker*`（跟踪器单测，注入时钟，含终止清单恢复）、
   `TestIdlePartitionWatermarkAdvances`（空闲→推进→恢复计入/去重/拒绝）、
-  `TestFinishedPartitionRejected`（终止与空闲的不同表现）。
+  `TestFinishedPartitionRejected`（终止与空闲的不同表现）、
+  `TestFinishedPartitionSurvivesRecovery`（恢复/扩缩容后终止分片仍被拒，含零数据分片）、
+  `TestIdlePartitionSemanticsAfterRecovery`（恢复后空闲语义保持）。
 
 ## 2. 检查点、恢复与幂等规则
 
 - **检查点内容**：`{ID, Watermark, MaxSeq, CommittedWindows, Parallelism,
-  WindowSize, MaxOutOfOrderness, AllowedLateness, Partitions}`。
-  通过**屏障协议**拍摄：路由线程向所有分片发送屏障，各分片处理完屏障前的全部事件、
-  并按当前全局水位线补齐到期窗口后暂停，此时快照满足不变式——
-  **凡定稿线 ≤ 水位线的窗口都已在 `CommittedWindows` 中**。这保证恢复后不会静默错算。
+  WindowSize, MaxOutOfOrderness, AllowedLateness, Partitions, FinishedPartitions}`。
+  通过**两轮屏障协议**拍摄：第一轮屏障等待各分片处理完屏障前的全部事件并暂停
+  （此后水位线稳定，读取全局水位线）；第二轮屏障让各分片按这同一个稳定水位线
+  补齐到期窗口后再次暂停，此时快照满足不变式——
+  **凡定稿线 ≤ 水位线的窗口都已在 `CommittedWindows` 中**。这保证恢复后不会静默错算
+  （若只发一轮屏障，不同分片会在不同时刻读到不同的水位线，
+  可能出现“水位线已越过定稿线、窗口却未提交”，恢复时该窗口的重放事件
+  会被误判迟到而丢失）。
 - **恢复模型**：窗口中间态不持久化；恢复时加载最近检查点，恢复水位线（含各分片进展）
   与已提交窗口集合，数据源**从头重放**（位点回退可界定：无检查点则回退到起点）。
   三层幂等共同保证“不重不丢”：
@@ -78,16 +101,22 @@ cmd/demo        端到端演示：go run ./cmd/demo
 
 ### 扩缩容恢复（换并行度）
 
-- **兼容范围**：检查点中的 `CommittedWindows`、水位线、各分片进展都是**并行度无关**
-  的状态（窗口按 key 标识、水位线按数据源分片合成），因此允许以不同 `Parallelism`
-  恢复——扩容（如 2→4）与缩容（如 4→1）均可。恢复后已提交窗口不重复输出、
-  未提交窗口不丢失，最终聚合与原并行度下的参考运行完全一致
-  （`TestRescaleRecovery`：2→4 / 4→1 / 2→2，断言下游零重复跳过、写出数=窗口数）。
+- **兼容范围**：检查点中的 `CommittedWindows`、水位线、各分片进展、已终止分片清单
+  都是**并行度无关**的状态（窗口按 key 标识、水位线按数据源分片合成），
+  因此允许以不同 `Parallelism` 恢复——扩容（如 2→4）与缩容（如 4→1）均可。
+  恢复后已提交窗口不重复输出、未提交窗口不丢失、已终止分片保持拒绝，
+  最终聚合与原并行度下的参考运行完全一致
+  （`TestRescaleRecovery`：2→4 / 4→1 / 2→2，断言下游零重复跳过、写出数=窗口数；
+  `TestFinishedPartitionSurvivesRecovery`：1→1 / 2→4 / 4→1 带终止分片恢复）。
 - **不兼容判定**：`WindowSize`、`MaxOutOfOrderness`、`AllowedLateness` 是窗口语义参数，
   决定窗口边界与定稿判定。检查点记录的这三个参数与引擎当前配置不一致时，
   `Start` 返回 `ErrIncompatibleCheckpoint`（错误信息含双方参数明细），
-  **明确拒绝恢复而不是静默算错**。旧版本格式（未记录语义参数，零值）的检查点
-  同样按不兼容拒绝。覆盖测试：`TestIncompatibleCheckpoint`。
+  **明确拒绝恢复而不是静默算错**。以下旧格式检查点同样按不兼容拒绝并给出提示：
+  - 未记录语义参数（零值）的更旧格式；
+  - 未记录已终止分片清单（`FinishedPartitions == nil`）的格式——
+    恢复会把已终止分片错误当作正常供数，属于会静默错算的缺字段，
+    错误信息会说明缺失字段与原因。
+  覆盖测试：`TestIncompatibleCheckpoint`。
 - 检查点中的 `Parallelism` 字段仅记录拍摄时的并行度，供审计与排障，不参与兼容性判定。
 
 ## 3. 背压策略与有界资源
@@ -106,20 +135,29 @@ cmd/demo        端到端演示：go run ./cmd/demo
 
 ## 4. 运行期状态快照
 
-`Engine.Snapshot()` 可在运行中随时调用（不阻塞事件处理管线），返回一份字段含义
-稳定的 `Snapshot`，用于排障与验收：
+`Engine.Snapshot()` 可在运行中随时调用，返回一份字段含义稳定的 `Snapshot`，
+用于排障与验收。
+
+**一致性保证**：运行中的快照经路由线程在与检查点相同的两轮屏障静态点拍摄
+（会短暂暂停各分片，换取严格一致）；引擎停止后处理管线已静止，直接读取。
+两种路径都保证同一份快照内各字段互为同一时刻的视图，不会自相矛盾——
+例如不会出现“拒绝/计入计数已加上、对应窗口却还没出现”，
+也不会出现“水位线已越过某窗口定稿线、该窗口却仍在待定清单”。
+反复调用读到的清单均排序、计数单调不减，可直接对比核对。
 
 | 字段 | 含义 | 验证方法 |
 |---|---|---|
-| `Watermark` | 当前全局事件时间水位线；零值表示尚未形成 | 与 `Engine.Watermark()` 一致；应单调不减 |
+| `Watermark` | 当前全局事件时间水位线；零值表示尚未形成 | 与 `Engine.Watermark()` 一致；应单调不减；不低于各 active 分片水位线的最小值 |
 | `MaxSeq` | 已处理事件的最大序号 | 应等于已注入事件的最大 Seq |
-| `Partitions` | 各数据源分片进展：`ID`、`Status`（active/idle/finished）、`MaxObserved`（分片最大事件时间）、`Watermark`（分片水位线=MaxObserved-乱序跨度）、`LastEventAt` | 全局水位线应等于各 active 分片水位线的最小值；超 `IdleTimeout` 未供数的分片应为 idle |
-| `PendingWindows` | 已打开但未定稿的窗口清单（等待水位线越过定稿线） | 窗口定稿线应都 > 当前水位线 |
+| `Partitions` | 各数据源分片进展：`ID`、`Status`（active/idle/finished）、`MaxObserved`（分片最大事件时间）、`Watermark`（分片水位线=MaxObserved-乱序跨度）、`LastEventAt` | 全局水位线应等于各 active 分片水位线的最小值（晚注册分片不回拉）；超 `IdleTimeout` 未供数的分片应为 idle；已宣告终止的分片（含零数据分片）应为 finished，且在检查点恢复后仍为 finished |
+| `PendingWindows` | 已打开但未定稿的窗口清单（等待水位线越过定稿线） | 窗口定稿线应都 > 当前水位线；与 `CommittedWindows` 无交集 |
 | `CommittedWindows` | 已定稿并提交下游的窗口清单（含检查点恢复出的部分） | 窗口定稿线应都 ≤ 当前水位线；与下游输出一一对应 |
 | `Drops` | 被拒绝事件按原因的精确计数；键集合固定为 `late_beyond_allowed_lateness` / `backpressure_buffer_full` / `partition_finished` | 与 `Stats` 中对应计数一致 |
-| `Stats` | 引擎累计计数（接收/计入/去重/各类拒绝/窗口输出/检查点数） | 接收 = 计入 + 重复跳过 + 各类拒绝（事件守恒） |
+| `Stats` | 引擎累计计数（接收/计入/去重/各类拒绝/窗口输出/检查点数） | 接收 = 计入 + 重复跳过 + 迟到拒绝 + 终止分片拒绝（事件守恒） |
 
-覆盖测试：`TestSnapshotFields`（运行中/空闲后/关闭后三个时点逐项校验字段语义）。
+覆盖测试：`TestSnapshotFields`（运行中/空闲后/关闭后三个时点逐项校验字段语义）、
+`TestSnapshotConsistentUnderConcurrency`（并发处理期间反复取快照，
+逐份校验上述全部不变式，并验证静止后连续快照内容稳定一致；并行度 1/2/4）。
 
 ## 5. 验证方法
 
@@ -142,6 +180,9 @@ go run ./cmd/demo                # 端到端演示
 | 并发度无关性 | `TestSameResultAcrossParallelism`（分片 1/2/4/8 × 并发 1/4/16） |
 | 分片空闲：水位线继续推进、恢复后计入/去重/拒绝 | `TestIdlePartitionWatermarkAdvances`、`TestTrackerIdleExcluded` |
 | 分片终止：与空闲可区分、后续事件拒绝 | `TestFinishedPartitionRejected`、`TestTrackerFinish` |
+| 恢复后终止分片（含零数据分片）仍被拒、结果一致 | `TestFinishedPartitionSurvivesRecovery`（并行度 1→1 / 2→4 / 4→1）、`TestTrackerRestoreFinished` |
+| 恢复后空闲语义保持（再空闲→推进→恢复供数） | `TestIdlePartitionSemanticsAfterRecovery`（并行度 2/4） |
+| 并发下反复取快照的一致性 | `TestSnapshotConsistentUnderConcurrency`（并行度 1/2/4） |
 | 扩缩容恢复（2→4 / 4→1 / 2→2）结果一致 | `TestRescaleRecovery` |
 | 不兼容检查点明确拒绝 | `TestIncompatibleCheckpoint` |
 | 状态快照字段语义 | `TestSnapshotFields` |
@@ -151,5 +192,7 @@ go run ./cmd/demo                # 端到端演示
 | 下游幂等 | `TestIdempotentWrite` |
 
 单测日志中以 `[水位线判定]`、`[窗口判定]`、`[逐条判定]`、`[检查点]`、`[窗口结果]`、
-`[引擎统计]`、`[拒绝明细]`、`[空闲判定]`、`[终止判定]`、`[扩缩容恢复]`、`[快照:*]`
-等前缀打印关键时刻的水位线、涉及窗口与每条事件的判定依据，可直接核对。
+`[引擎统计]`、`[拒绝明细]`、`[空闲判定]`、`[终止判定]`、`[终止宣告]`、`[恢复]`、
+`[扩缩容恢复]`、`[快照:*]`、`[快照一致性]`、`[快照稳定性]`、`[结论]`
+等前缀打印每个用例的输入、关键时刻的水位线、涉及窗口与每条事件的判定依据，
+可直接核对。
