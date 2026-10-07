@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -30,8 +31,20 @@ func logSnapshot(t *testing.T, snap Snapshot, tag string) {
 	t.Logf("[快照:%s] 水位线=%ds maxSeq=%d 待定时窗口=%d 已定稿窗口=%d",
 		tag, snap.Watermark.Unix(), snap.MaxSeq, len(snap.PendingWindows), len(snap.CommittedWindows))
 	for _, p := range snap.Partitions {
-		t.Logf("[快照:%s] 分片=%s 状态=%s 分片水位线=%ds 最大事件时间=%ds",
-			tag, p.ID, p.Status, p.Watermark.Unix(), p.MaxObserved.Unix())
+		maxObs, partWM := "-", "-"
+		if !p.MaxObserved.IsZero() {
+			maxObs = fmt.Sprintf("%ds", p.MaxObserved.Unix())
+		}
+		if !p.Watermark.IsZero() {
+			partWM = fmt.Sprintf("%ds", p.Watermark.Unix())
+		}
+		if p.Status == watermark.StatusFinished {
+			t.Logf("[快照:%s] 分片=%s 状态=%s 最大事件时间=%s 终止位点finishSeq=%d(有效=%v)",
+				tag, p.ID, p.Status, maxObs, p.FinishSeq, p.HasFinishSeq)
+		} else {
+			t.Logf("[快照:%s] 分片=%s 状态=%s 分片水位线=%s 最大事件时间=%s",
+				tag, p.ID, p.Status, partWM, maxObs)
+		}
 	}
 	for _, w := range snap.PendingWindows {
 		t.Logf("[快照:%s] 待定 key=%s window=[%d,%d)s", tag, w.Key, w.Start.Unix(), w.End.Unix())

@@ -78,10 +78,12 @@ type shardMsg struct {
 	barrier *barrier
 }
 
-// barrier 是分片间的暂停/恢复屏障，用于拍摄一致检查点。
+// barrier 是分片间的对齐标记：分片处理到它时，之前路由来的全部事件都已完成。
+// flush=true 时分片先按 flushWM 精确冲刷到期窗口再 ack。
 type barrier struct {
-	ack    chan struct{} // 每个分片处理到屏障时发送一次
-	resume chan struct{} // 关闭后分片继续运行
+	ack     chan struct{} // 每个分片处理到标记时发送一次（缓冲=分片数，不阻塞）
+	flush   bool          // 处理到标记时先按 flushWM 冲刷到期窗口
+	flushWM time.Time
 }
 
 type shard struct {
@@ -111,6 +113,7 @@ type Engine struct {
 	started   atomic.Bool
 
 	ckptReq  chan ckptRequest
+	snapReq  chan snapRequest
 	wmNotify chan struct{} // 分片→路由的水位线推进通知（容量1，非阻塞投递）
 	ctx      context.Context
 
@@ -144,6 +147,11 @@ type ckptResult struct {
 	err error
 }
 
+// snapRequest 为一次一致快照请求：经路由线程以屏障协议在分片暂停点拍摄。
+type snapRequest struct {
+	reply chan Snapshot
+}
+
 // New 创建引擎；store 为 nil 时不做持久化检查点。
 func New(cfg Config, snk sink.Sink, store checkpoint.Store) *Engine {
 	if cfg.WindowSize <= 0 {
@@ -172,15 +180,19 @@ func New(cfg Config, snk sink.Sink, store checkpoint.Store) *Engine {
 		committed: make(map[checkpoint.WindowRef]struct{}),
 		openRefs:  make(map[checkpoint.WindowRef]struct{}),
 		ckptReq:   make(chan ckptRequest),
+		snapReq:   make(chan snapRequest),
 		wmNotify:  make(chan struct{}, 1),
 	}
 }
 
 // Start 启动后台处理 goroutine 并从检查点恢复（若存在）。
 //
-// 恢复语义：加载最近检查点，恢复水位线与已提交窗口集合；
+// 恢复语义：加载最近检查点，恢复水位线、各数据源分片供数状态
+// （含终止标记与终止位点）与已提交窗口集合；
 // 窗口中间态不持久化，要求数据源从最早事件开始重放，
-// 由 Seq 去重、已提交窗口集合与下游幂等写共同保证结果不重不丢。
+// 由 Seq 去重、已提交窗口集合、分片终止位点与下游幂等写共同保证结果不重不丢：
+//   - 已终止分片恢复后保持终止，其终止位点之后的事件仍以 partition_finished 拒绝；
+//   - 终止位点之内的重放事件重新接受，用于完整重建检查点时尚未定稿的窗口。
 func (e *Engine) Start(ctx context.Context) error {
 	if !e.started.CompareAndSwap(false, true) {
 		return errors.New("engine: already started")
@@ -197,7 +209,7 @@ func (e *Engine) Start(ctx context.Context) error {
 				e.cancel()
 				return err
 			}
-			e.wm.Restore(cp.Partitions, cp.Watermark)
+			e.wm.Restore(partitionSnapshots(cp.Partitions), cp.Watermark)
 			for _, ref := range cp.CommittedWindows {
 				e.committed[ref] = struct{}{}
 			}
@@ -249,6 +261,8 @@ func (e *Engine) runRouter(ctx context.Context) {
 		case req := <-e.ckptReq:
 			cp, err := e.barrierCheckpoint(ctx)
 			req.reply <- ckptResult{cp: cp, err: err}
+		case req := <-e.snapReq:
+			req.reply <- e.barrierSnapshot(ctx)
 		case ev, ok := <-in:
 			if !ok {
 				// 入口关闭：关闭各分片通道，分片会冲刷剩余窗口后退出。
@@ -258,7 +272,7 @@ func (e *Engine) runRouter(ctx context.Context) {
 				e.shardWg.Wait()
 				// 冲刷完成后做最后一次检查点，固化全部已提交窗口。
 				if e.store != nil {
-					_, _ = e.saveSnapshot(ctx)
+					_, _ = e.saveSnapshot(ctx, e.wm.Current())
 				}
 				return
 			}
@@ -291,15 +305,15 @@ func (e *Engine) runShard(ctx context.Context, sh *shard) {
 				return
 			}
 			if msg.barrier != nil {
-				// 处理到屏障：此前所有事件均已完成。
-				// 先按当前全局水位线冲刷到期窗口再 ack：
-				// 多分片（数据源）水位线取 min，本分片窗口可能因其他分片
-				// 推进的水位线而到期，必须在此补齐，才能维持检查点不变式
-				// “凡定稿线 <= 水位线的窗口都已在已提交集合中”。
-				e.emitDue(sh, e.wm.Current())
-				msg.barrier.ack <- struct{}{}
+				// 处理到对齐标记：此前路由来的所有事件均已完成。
+				// flush 标记按路由线程给定的同一水位线冲刷到期窗口——
+				// 各分片不自行读取水位线，避免“读到的水位线新旧不一”
+				// 导致同一割切下有的分片定稿、有的没定稿。
+				if msg.barrier.flush {
+					e.emitDue(sh, msg.barrier.flushWM)
+				}
 				select {
-				case <-msg.barrier.resume:
+				case msg.barrier.ack <- struct{}{}:
 				case <-ctx.Done():
 					return
 				}
@@ -322,7 +336,7 @@ func (e *Engine) process(ctx context.Context, sh *shard, ev event.Event) {
 		e.maxSeq.Store(s)
 	}
 
-	wm, ok := e.wm.Observe(ev.Partition, ev.Timestamp)
+	wm, ok := e.wm.Observe(ev.Partition, ev.Timestamp, ev.Seq)
 	if !ok {
 		// 分片已被显式宣告彻底不再供数：明确拒绝，原因与迟到/背压可区分。
 		e.reject(ev, event.ReasonPartitionFinished)
@@ -465,38 +479,78 @@ func (e *Engine) FinishPartition(id string) {
 	e.wm.Finish(id)
 }
 
-// barrierCheckpoint 暂停全部分片，在静态点拍摄快照后恢复。
+// barrierCheckpoint 在一致的割切点拍摄检查点。
 //
-// 静态点保证不变式：凡 deadline <= watermark 的窗口都已在已提交集合中，
+// 割切由两阶段对齐协议产生（见 barrierCut）：静态点保证不变式——
+// 凡 deadline <= watermark 的窗口都已在已提交集合中，
 // 因此恢复时“旧水位线 + 重放 + 幂等去重”不会丢失或重复任何窗口结果。
 func (e *Engine) barrierCheckpoint(ctx context.Context) (*checkpoint.Checkpoint, error) {
 	if e.store == nil {
 		return nil, nil
 	}
-	b := &barrier{
-		ack:    make(chan struct{}, len(e.shards)),
-		resume: make(chan struct{}),
+	wm, ok := e.barrierCut(ctx)
+	if !ok {
+		return nil, ctx.Err()
 	}
+	return e.saveSnapshot(ctx, wm)
+}
+
+// barrierSnapshot 用与检查点相同的两阶段对齐协议拍摄一致的状态快照：
+// 水位线、分片状态、待定/已定稿窗口清单与各项计数都对应同一处理割切，
+// 彼此之间不会自相矛盾（例如不会出现“计数已加上、对应窗口却还没出现”，
+// 或“窗口定稿线不晚于水位线却仍在待定清单”）。
+func (e *Engine) barrierSnapshot(ctx context.Context) Snapshot {
+	wm, ok := e.barrierCut(ctx)
+	if !ok {
+		return e.collectSnapshot()
+	}
+	return e.collectSnapshotAt(wm)
+}
+
+// barrierCut 产生一个全引擎一致的处理割切，返回割切水位线。
+//
+// 两阶段对齐（路由线程串行执行，期间没有新事件被路由）：
+//  1. 对齐标记：各分片处理完标记前的全部事件后 ack——
+//     此后没有任何分片还在处理事件，水位线稳定，读取即为割切水位线；
+//  2. 冲刷标记：各分片按同一切口水位线精确补齐到期窗口——
+//     若让各分片自行读取水位线，先读的分片用旧值、后读的用新值，
+//     同一割切下窗口定稿口径不一（快照/检查点自相矛盾的根源）。
+//
+// 协议结束后分片立即恢复运行；调用方随后读取的状态仍是该割切的静态视图
+// （路由线程未返回主循环前不会有新事件进入分片）。
+func (e *Engine) barrierCut(ctx context.Context) (time.Time, bool) {
+	mark := &barrier{ack: make(chan struct{}, len(e.shards))}
+	if !e.broadcast(ctx, mark) {
+		return time.Time{}, false
+	}
+	wm := e.wm.Current()
+	flush := &barrier{ack: make(chan struct{}, len(e.shards)), flush: true, flushWM: wm}
+	if !e.broadcast(ctx, flush) {
+		return time.Time{}, false
+	}
+	return wm, true
+}
+
+// broadcast 向全部处理分片发送对齐标记并等待所有 ack。
+func (e *Engine) broadcast(ctx context.Context, b *barrier) bool {
 	for _, sh := range e.shards {
 		select {
 		case sh.ch <- shardMsg{barrier: b}:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return false
 		}
 	}
 	for range e.shards {
 		select {
 		case <-b.ack:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return false
 		}
 	}
-	cp, err := e.saveSnapshot(ctx)
-	close(b.resume)
-	return cp, err
+	return true
 }
 
-func (e *Engine) saveSnapshot(ctx context.Context) (*checkpoint.Checkpoint, error) {
+func (e *Engine) saveSnapshot(ctx context.Context, wm time.Time) (*checkpoint.Checkpoint, error) {
 	e.committedMu.Lock()
 	refs := make([]checkpoint.WindowRef, 0, len(e.committed))
 	for ref := range e.committed {
@@ -513,7 +567,7 @@ func (e *Engine) saveSnapshot(ctx context.Context) (*checkpoint.Checkpoint, erro
 	id := e.checkpoints.Add(1)
 	cp := &checkpoint.Checkpoint{
 		ID:                id,
-		Watermark:         e.wm.Current(),
+		Watermark:         wm,
 		MaxSeq:            e.maxSeq.Load(),
 		CommittedWindows:  refs,
 		Parallelism:       e.cfg.Parallelism,
@@ -529,13 +583,36 @@ func (e *Engine) saveSnapshot(ctx context.Context) (*checkpoint.Checkpoint, erro
 	return cp, nil
 }
 
-// partitionProgress 导出各数据源分片已观测的最大事件时间（供检查点持久化）。
-func (e *Engine) partitionProgress() map[string]time.Time {
+// partitionProgress 导出各数据源分片的供数状态（供检查点持久化）。
+//
+// 已终止分片必须一并导出——包括一条数据都没出过就被停掉的分片
+// （MaxObserved 为零值）：漏掉它们会导致恢复后“复活”为正常供数。
+func (e *Engine) partitionProgress() map[string]checkpoint.PartitionState {
 	infos := e.wm.Partitions()
-	out := make(map[string]time.Time, len(infos))
+	out := make(map[string]checkpoint.PartitionState, len(infos))
 	for _, info := range infos {
-		if !info.MaxObserved.IsZero() {
-			out[info.ID] = info.MaxObserved
+		out[info.ID] = checkpoint.PartitionState{
+			MaxObserved:  info.MaxObserved,
+			Finished:     info.Status == watermark.StatusFinished,
+			FinishSeq:    info.FinishSeq,
+			HasFinishSeq: info.HasFinishSeq,
+		}
+	}
+	return out
+}
+
+// partitionSnapshots 把检查点中的分片状态转换为水位线跟踪器的恢复输入。
+func partitionSnapshots(parts map[string]checkpoint.PartitionState) map[string]watermark.PartitionSnapshot {
+	if parts == nil {
+		return nil
+	}
+	out := make(map[string]watermark.PartitionSnapshot, len(parts))
+	for id, st := range parts {
+		out[id] = watermark.PartitionSnapshot{
+			MaxObserved:  st.MaxObserved,
+			Finished:     st.Finished,
+			FinishSeq:    st.FinishSeq,
+			HasFinishSeq: st.HasFinishSeq,
 		}
 	}
 	return out

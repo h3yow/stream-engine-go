@@ -34,6 +34,20 @@ func logCheckpoint(t *testing.T, cp *checkpoint.Checkpoint) {
 		t.Logf("           已提交 key=%s window=[%d,%d)s",
 			r.Key, r.Start.Unix(), r.End.Unix())
 	}
+	ids := make([]string, 0, len(cp.Partitions))
+	for id := range cp.Partitions {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		st := cp.Partitions[id]
+		if st.Finished {
+			t.Logf("           分片 %s 状态=finished 最大事件时间=%ds 终止位点finishSeq=%d(有效=%v)",
+				id, st.MaxObserved.Unix(), st.FinishSeq, st.HasFinishSeq)
+		} else {
+			t.Logf("           分片 %s 状态=供数中 最大事件时间=%ds", id, st.MaxObserved.Unix())
+		}
+	}
 }
 
 // TestCrashReplayRecovery 崩溃后从检查点重放：

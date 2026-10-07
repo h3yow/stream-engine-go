@@ -31,6 +31,27 @@ type PartitionInfo struct {
 	Watermark time.Time
 	// LastEventAt 为该分片最近一次观测到事件的处理时间（空闲判定依据）。
 	LastEventAt time.Time
+	// FinishSeq 为终止宣告时刻该分片已观测的最大事件序号（仅 finished 有意义）：
+	// 恢复重放时 Seq <= FinishSeq 的事件是终止前已计入的，必须重新接受以重建
+	// 未定稿窗口；Seq > FinishSeq 的事件是终止后到达的，应明确拒绝。
+	FinishSeq int64
+	// HasFinishSeq=false 表示终止前未观测到任何事件（恢复后该分片任何事件都拒绝）。
+	HasFinishSeq bool
+}
+
+// PartitionSnapshot 是单个数据源分片供数状态的可持久化形式（用于检查点）。
+//
+// 关键不变式：finished 状态与其终止位点必须随检查点持久化，
+// 否则恢复后已终止分片会“复活”为正常供数，导致恢复前后结果不一致。
+type PartitionSnapshot struct {
+	// MaxObserved 为该分片已观测的最大事件时间；零值表示从未观测到事件。
+	MaxObserved time.Time
+	// Finished 表示该分片已被显式宣告彻底不再供数（不可逆）。
+	Finished bool
+	// FinishSeq 为终止宣告时刻该分片已观测的最大事件序号（见 PartitionInfo.FinishSeq）。
+	FinishSeq int64
+	// HasFinishSeq=false 表示终止前未观测到任何事件。
+	HasFinishSeq bool
 }
 
 // partState 为分片的内部可变状态。
@@ -38,7 +59,11 @@ type partState struct {
 	maxObserved time.Time
 	started     bool
 	lastEventAt time.Time
+	maxSeq      int64
+	hasSeq      bool
 	finished    bool
+	finishSeq   int64
+	hasFinSeq   bool
 }
 
 // Tracker 按数据源分片分别跟踪事件时间进展，合成全局水位线：
@@ -75,11 +100,16 @@ func NewTrackerWithClock(maxOutOfOrderness, idleTimeout time.Duration, now func(
 	}
 }
 
-// Observe 观测分片 partition 的一条事件时间，返回推进后的全局水位线。
+// Observe 观测分片 partition 的一条事件（事件时间 ts、数据源序号 seq），
+// 返回推进后的全局水位线。
 //
-// 若该分片已被 Finish 宣告终止，返回 ok=false：调用方应以
-// partition_finished 原因拒绝该事件，分片状态与水位线均不受影响。
-func (t *Tracker) Observe(partition string, ts time.Time) (wm time.Time, ok bool) {
+// 若该分片已被 Finish 宣告终止：
+//   - seq 在终止位点之后（或终止前无任何事件）：返回 ok=false，调用方应以
+//     partition_finished 原因拒绝该事件，分片状态与水位线均不受影响；
+//   - seq 不越过终止位点：这是检查点恢复后重放的“终止前已计入”事件，
+//     返回 ok=true 允许调用方重新计入以重建未定稿窗口，
+//     但分片仍保持 finished，不参与水位线计算。
+func (t *Tracker) Observe(partition string, ts time.Time, seq int64) (wm time.Time, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	p := t.parts[partition]
@@ -88,11 +118,18 @@ func (t *Tracker) Observe(partition string, ts time.Time) (wm time.Time, ok bool
 		t.parts[partition] = p
 	}
 	if p.finished {
+		if p.hasFinSeq && seq <= p.finishSeq {
+			return t.wmOrZero(), true
+		}
 		return t.wmOrZero(), false
 	}
 	if !p.started || ts.After(p.maxObserved) {
 		p.maxObserved = ts
 		p.started = true
+	}
+	if !p.hasSeq || seq > p.maxSeq {
+		p.maxSeq = seq
+		p.hasSeq = true
 	}
 	p.lastEventAt = t.now()
 	t.recomputeLocked()
@@ -102,8 +139,9 @@ func (t *Tracker) Observe(partition string, ts time.Time) (wm time.Time, ok bool
 // Finish 显式宣告分片彻底不再供数。
 //
 // 与 idle（暂时无数据、可自动恢复）不同，finished 不可逆：
-// 分片被永久排除出水位线计算，其后的 Observe 一律返回 ok=false。
-// 对从未观测过的分片调用 Finish 同样生效（登记为 finished）。
+// 分片被永久排除出水位线计算，其后序号越过终止位点的 Observe 一律返回 ok=false。
+// 对从未观测过的分片调用 Finish 同样生效（登记为 finished，终止位点为空）。
+// 终止位点 = 宣告时刻该分片已观测的最大事件序号，随检查点持久化（见 PartitionSnapshot）。
 func (t *Tracker) Finish(partition string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -112,7 +150,11 @@ func (t *Tracker) Finish(partition string) {
 		p = &partState{}
 		t.parts[partition] = p
 	}
-	p.finished = true
+	if !p.finished {
+		p.finished = true
+		p.finishSeq = p.maxSeq
+		p.hasFinSeq = p.hasSeq
+	}
 	t.recomputeLocked()
 }
 
@@ -131,7 +173,10 @@ func (t *Tracker) Partitions() []PartitionInfo {
 	t.recomputeLocked()
 	out := make([]PartitionInfo, 0, len(t.parts))
 	for id, p := range t.parts {
-		info := PartitionInfo{ID: id, Status: t.statusLocked(p), LastEventAt: p.lastEventAt}
+		info := PartitionInfo{
+			ID: id, Status: t.statusLocked(p), LastEventAt: p.lastEventAt,
+			FinishSeq: p.finishSeq, HasFinishSeq: p.hasFinSeq,
+		}
 		if p.started {
 			info.MaxObserved = p.maxObserved
 			info.Watermark = p.maxObserved.Add(-t.maxOutOfOrderness)
@@ -142,24 +187,36 @@ func (t *Tracker) Partitions() []PartitionInfo {
 	return out
 }
 
-// Restore 从检查点恢复：parts 为各分片已观测的最大事件时间，
+// Restore 从检查点恢复：parts 为各分片的可持久化供数状态（含终止标记与终止位点），
 // wm 为快照时刻的全局水位线（兜底，保证恢复后水位线不回退）。
-// 恢复的分片一律以 active 状态重新开始空闲计时。
-func (t *Tracker) Restore(parts map[string]time.Time, wm time.Time) {
+//
+// 恢复后语义：
+//   - 未终止分片一律以 active 状态重新开始空闲计时，静默超过空闲阈值后
+//     照常转入 idle 被排除（与恢复前表现一致）；
+//   - 已终止分片保持 finished（包括终止前从未供数的分片），永久排除出水位线计算，
+//     其终止位点之后的事件继续被拒绝，位点之内的重放事件允许重新计入。
+func (t *Tracker) Restore(parts map[string]PartitionSnapshot, wm time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
-	for id, maxObs := range parts {
+	for id, snap := range parts {
 		p := t.parts[id]
 		if p == nil {
 			p = &partState{}
 			t.parts[id] = p
 		}
-		if !p.started || maxObs.After(p.maxObserved) {
-			p.maxObserved = maxObs
-			p.started = true
+		if !snap.MaxObserved.IsZero() {
+			if !p.started || snap.MaxObserved.After(p.maxObserved) {
+				p.maxObserved = snap.MaxObserved
+				p.started = true
+			}
+			p.lastEventAt = now
 		}
-		p.lastEventAt = now
+		if snap.Finished {
+			p.finished = true
+			p.finishSeq = snap.FinishSeq
+			p.hasFinSeq = snap.HasFinishSeq
+		}
 	}
 	if !wm.IsZero() && (!t.hasWM || wm.After(t.wm)) {
 		t.wm = wm
